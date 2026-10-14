@@ -504,18 +504,28 @@ class XfrmInterface(IpSecBaseInterface):
                            self.xfrm_if_id)
 
   def Migrate(self, new_underlying_netid, new_local, new_remote):
-    self.xfrm.MigrateTunnel(xfrm.XFRM_POLICY_IN, None, self.remote, self.local,
-                            new_remote, new_local, self.in_sa.spi,
-                            self.crypt, self.auth, None, None,
-                            new_underlying_netid, self.xfrm_if_id)
+    old_local = self.local
 
-    self.xfrm.MigrateTunnel(xfrm.XFRM_POLICY_OUT, None, self.local, self.remote,
-                            new_local, new_remote, self.out_sa.spi,
-                            self.crypt, self.auth, None, None,
-                            new_underlying_netid, self.xfrm_if_id)
+    in_migrated, err = self.xfrm.MigrateTunnel(
+        xfrm.XFRM_POLICY_IN, None, self.remote, old_local,
+        new_remote, new_local, self.in_sa.spi,
+        self.crypt, self.auth, None, None,
+        new_underlying_netid, self.xfrm_if_id)
+    if in_migrated:
+      self.local = new_local
+    if err is not None:
+      raise err
 
-    self.local = new_local
-    self.remote = new_remote
+    out_migrated, err = self.xfrm.MigrateTunnel(
+        xfrm.XFRM_POLICY_OUT, None, old_local, self.remote,
+        new_local, new_remote, self.out_sa.spi,
+        self.crypt, self.auth, None, None,
+        new_underlying_netid, self.xfrm_if_id)
+    if out_migrated:
+      self.remote = new_remote
+    if err is not None:
+      raise err
+
     self.version = net_test.GetAddressVersion(new_local)
     self.underlying_netid = new_underlying_netid
 
@@ -1022,7 +1032,7 @@ class XfrmInterfaceMigrateTest(XfrmTunnelBase):
     old_underlying_netid = tunnel.underlying_netid
     old_local = tunnel.local
     old_remote = tunnel.remote
-
+    old_version = tunnel.version
 
     try:
       self._RebuildTunnel(tunnel, use_null_crypt)
@@ -1046,11 +1056,11 @@ class XfrmInterfaceMigrateTest(XfrmTunnelBase):
       # Reset the tunnel to the original configuration
       tunnel.TeardownXfrm()
 
-      self.local = old_local
-      self.remote = old_remote
-      self.underlying_netid = old_underlying_netid
+      tunnel.local = old_local
+      tunnel.remote = old_remote
+      tunnel.version = old_version
+      tunnel.underlying_netid = old_underlying_netid
       tunnel.SetupXfrm(False)
-
 
   def ParamTestMigrateXfrmIntfInput(self, inner_version, outer_version,
                                     new_outer_version):

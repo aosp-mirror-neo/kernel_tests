@@ -738,6 +738,11 @@ class Xfrm(netlink.NetlinkSocket):
       new_output_mark: The mark used to select the new underlying network
         for packets outbound from xfrm. None means unspecified.
       xfrm_if_id: The XFRM interface ID
+
+    Returns:
+      A tuple of (migrated, err), where migrated is True if XFRM_MSG_MIGRATE
+      succeeded and err is the IOError raised by XFRM_MSG_MIGRATE or UPDSA, or
+      None if both succeeded.
     """
 
     if selector is None:
@@ -756,13 +761,29 @@ class Xfrm(netlink.NetlinkSocket):
     if xfrm_if_id is not None:
       nlattrs.append((XFRMA_IF_ID, struct.pack("=I", xfrm_if_id)))
 
-    for selector in selectors:
-      self.SendXfrmNlRequest(XFRM_MSG_MIGRATE,
-                             XfrmUserpolicyId(sel=selector, dir=direction), nlattrs)
+    migrated = False
+    try:
+      for selector in selectors:
+        self.SendXfrmNlRequest(
+            XFRM_MSG_MIGRATE, XfrmUserpolicyId(sel=selector, dir=direction),
+            nlattrs)
+        # All policies in selectors share the same SA, so the first successful
+        # XFRM_MSG_MIGRATE already migrates the SA to the new addresses. Failing
+        # on a subsequent selector does not affect policy cleanup because
+        # DeletePolicyInfo does not depend on the tunnel addresses.
+        migrated = True
+    except IOError as e:
+      return migrated, e
 
     # UPDSA is called exclusively to update the set_mark=new_output_mark.
-    self.AddSaInfo(new_saddr, new_daddr, spi, XFRM_MODE_TUNNEL, 0, encryption,
-                   auth_trunc, aead, encap, None, new_output_mark, True, xfrm_if_id)
+    try:
+      self.AddSaInfo(new_saddr, new_daddr, spi, XFRM_MODE_TUNNEL, 0, encryption,
+                     auth_trunc, aead, encap, None, new_output_mark, True,
+                     xfrm_if_id)
+    except IOError as e:
+      return True, e
+
+    return True, None
 
 
 if __name__ == "__main__":

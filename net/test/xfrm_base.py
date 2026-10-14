@@ -42,6 +42,7 @@ _ALGO_CBC_AES_256 = (xfrm.XfrmAlgo((xfrm.XFRM_EALG_CBC_AES, 256)),
 # Match all bits of the mark
 MARK_MASK_ALL = 0xffffffff
 
+REMOTE_UDP_ENCAP_PORT = 4500
 
 def SetPolicySockopt(sock, family, opt_data):
   optlen = len(opt_data) if opt_data is not None else 0
@@ -81,6 +82,19 @@ def ApplySocketPolicy(sock, family, direction, spi, reqid, tun_addrs):
   # have an IPv4 policy on a dual-stack socket.
   sockfamily = sock.getsockopt(SOL_SOCKET, net_test.SO_DOMAIN)
   SetPolicySockopt(sock, sockfamily, opt_data)
+
+
+def CreateUdpEncapSocket(family, addr):
+  # Reserve a port on which to receive UDP encapsulated packets. Sending
+  # packets works without this (and potentially can send packets with a source
+  # port belonging to another application), but receiving requires the port to
+  # be bound and the encapsulation socket option enabled.
+  encap_sock = net_test.Socket(family, SOCK_DGRAM, 0)
+  encap_sock.bind((addr, 0))
+  encap_port = encap_sock.getsockname()[1]
+  encap_sock.setsockopt(IPPROTO_UDP, xfrm.UDP_ENCAP, xfrm.UDP_ENCAP_ESPINUDP)
+  return encap_sock, encap_port
+
 
 def _GetCryptParameters(crypt_alg):
   """Looks up encryption algorithm's block and IV lengths.
@@ -318,6 +332,16 @@ class XfrmBaseTest(multinetwork_base.MultiNetworkBaseTest):
     if payload.nh == IPPROTO_ICMPV6:
       return True
     return payload.nh == IPPROTO_HOPOPTS and payload.payload.nh == IPPROTO_ICMPV6
+
+  def assertIsUdpEncapEsp(self, packet, spi, seq, length, sport, dport):
+    protocol = packet.nh if packet.version == 6 else packet.proto
+    self.assertEqual(IPPROTO_UDP, protocol)
+    udp_hdr = packet[scapy.UDP]
+    self.assertEqual(sport, udp_hdr.sport)
+    self.assertEqual(dport, udp_hdr.dport)
+    self.assertEqual(length, len(udp_hdr))
+    esp_hdr, _ = cstruct.Read(bytes(udp_hdr.payload), xfrm.EspHdr)
+    self.assertEqual(xfrm.EspHdr((spi, seq)), esp_hdr)
 
   def _ExpectEspPacketOn(self, netid, spi, seq, length, src_addr, dst_addr):
     """Read a packet from a netid and verify its properties.
