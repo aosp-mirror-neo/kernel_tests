@@ -559,17 +559,18 @@ class MultiNetworkBaseTest(net_test.NetworkTest):
     packet = scapy.Ether(src=routermac, dst=mymac) / ip_packet
     self.ReceiveEtherPacketOn(netid, packet)
 
-  def ReadAllPacketsOn(self, netid, include_multicast=False):
+  def ReadAllPacketsOn(self, netid, include_multicast=False, max_retries=1):
     """Return all queued packets on a netid as a list.
 
     Args:
       netid: The netid from which to read packets
       include_multicast: A boolean, whether to remove multicast packets
         (default=False)
+      max_retries: The maximum number of 10ms retries when no packets are
+        initially queued (default=1)
     """
     packets = []
     retries = 0
-    max_retries = 1
     while True:
       try:
         packet = posix.read(self.tuns[netid].fileno(), 4096)
@@ -719,7 +720,8 @@ class MultiNetworkBaseTest(net_test.NetworkTest):
     else:
       include_multicast = False
 
-    packets = self.ReadAllPacketsOn(netid, include_multicast=include_multicast)
+    packets = self.ReadAllPacketsOn(
+        netid, include_multicast=include_multicast, max_retries=10)
     self.assertTrue(packets, msg + ": received no packets")
 
     # If we receive a packet that matches what we expected, return it.
