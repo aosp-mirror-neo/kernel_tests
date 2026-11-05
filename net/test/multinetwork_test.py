@@ -505,43 +505,52 @@ class TCPAcceptTest(multinetwork_base.InboundMarkingTest):
       version: An integer, 4 or 6.
       modes: A list of modes to excercise.
     """
-    for syncookies in [0, 2]:
-      for mode in modes:
-        for netid, iif, ip_if, myaddr, remoteaddr in self.Combinations(version):
-          listensocket = self.listensocket
-          listenport = listensocket.getsockname()[1]
+    has_syncookies = os.path.isfile(SYNCOOKIES_SYSCTL)
+    if has_syncookies:
+      orig_syncookies = self.GetSysctl(SYNCOOKIES_SYSCTL)
+    try:
+      for syncookies in [0, 2]:
+        if has_syncookies:
+          self.SetSysctl(SYNCOOKIES_SYSCTL, syncookies)
+        for mode in modes:
+          for netid, iif, ip_if, myaddr, remoteaddr in self.Combinations(version):
+            listensocket = self.listensocket
+            listenport = listensocket.getsockname()[1]
 
-          accept_sysctl = 1 if mode == self.MODE_INCOMING_MARK else 0
-          self._SetTCPMarkAcceptSysctl(accept_sysctl)
-          self.SetMarkReflectSysctls(accept_sysctl)
+            accept_sysctl = 1 if mode == self.MODE_INCOMING_MARK else 0
+            self._SetTCPMarkAcceptSysctl(accept_sysctl)
+            self.SetMarkReflectSysctls(accept_sysctl)
 
-          bound_dev = iif if mode == self.MODE_BINDTODEVICE else None
-          self.BindToDevice(listensocket, bound_dev)
+            bound_dev = iif if mode == self.MODE_BINDTODEVICE else None
+            self.BindToDevice(listensocket, bound_dev)
 
-          mark = netid if mode == self.MODE_EXPLICIT_MARK else 0
-          self.SetSocketMark(listensocket, mark)
+            mark = netid if mode == self.MODE_EXPLICIT_MARK else 0
+            self.SetSocketMark(listensocket, mark)
 
-          uid = self.UidForNetid(netid) if mode == self.MODE_UID else 0
-          os.fchown(listensocket.fileno(), uid, -1)
+            uid = self.UidForNetid(netid) if mode == self.MODE_UID else 0
+            os.fchown(listensocket.fileno(), uid, -1)
 
-          # Generate the packet here instead of in the outer loop, so
-          # subsequent TCP connections use different source ports and
-          # retransmissions from old connections don't confuse subsequent
-          # tests.
-          desc, packet = packets.SYN(listenport, version, remoteaddr, myaddr)
+            # Generate the packet here instead of in the outer loop, so
+            # subsequent TCP connections use different source ports and
+            # retransmissions from old connections don't confuse subsequent
+            # tests.
+            desc, packet = packets.SYN(listenport, version, remoteaddr, myaddr)
 
-          if mode:
-            reply_desc, reply = packets.SYNACK(version, myaddr, remoteaddr,
-                                               packet)
-          else:
-            reply_desc, reply = None, None
+            if mode:
+              reply_desc, reply = packets.SYNACK(version, myaddr, remoteaddr,
+                                                 packet)
+            else:
+              reply_desc, reply = None, None
 
-          extra = "mode=%s, syncookies=%d" % (mode, syncookies)
-          msg = self._FormatMessage(iif, ip_if, extra, desc, reply_desc)
-          reply = self._ReceiveAndExpectResponse(netid, packet, reply, msg)
-          if reply:
-            self.CheckTCPConnection(mode, listensocket, netid, version, myaddr,
-                                    remoteaddr, packet, reply, msg)
+            extra = "mode=%s, syncookies=%d" % (mode, syncookies)
+            msg = self._FormatMessage(iif, ip_if, extra, desc, reply_desc)
+            reply = self._ReceiveAndExpectResponse(netid, packet, reply, msg)
+            if reply:
+              self.CheckTCPConnection(mode, listensocket, netid, version, myaddr,
+                                      remoteaddr, packet, reply, msg)
+    finally:
+      if has_syncookies:
+        self.SetSysctl(SYNCOOKIES_SYSCTL, orig_syncookies)
 
   def testBasicTCP(self):
     self.CheckTCP(4, [None, self.MODE_BINDTODEVICE, self.MODE_EXPLICIT_MARK])
