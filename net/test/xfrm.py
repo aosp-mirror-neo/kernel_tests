@@ -643,7 +643,8 @@ class Xfrm(netlink.NetlinkSocket):
     self._SendNlRequest(XFRM_MSG_FLUSHSA, usersa_flush.Pack(), flags)
 
   def CreateTunnel(self, direction, selector, src, dst, spi, encryption,
-                   auth_trunc, mark, output_mark, xfrm_if_id, match_method):
+                   auth_trunc, mark, output_mark, xfrm_if_id, match_method,
+                   encap=None):
     """Create an XFRM Tunnel Consisting of a Policy and an SA.
 
     Create a unidirectional XFRM tunnel, which entails one Policy and one
@@ -667,6 +668,7 @@ class Xfrm(netlink.NetlinkSocket):
       xfrm_if_id: The ID of the XFRM interface to use or None.
       match_method: One of MATCH_METHOD_[MARK | ALL | IFID]. This determines how
         SAs and policies are matched.
+      encap: An XfrmEncapTmpl structure, or None.
     """
     outer_family = net_test.GetAddressFamily(net_test.GetAddressVersion(dst))
 
@@ -691,7 +693,7 @@ class Xfrm(netlink.NetlinkSocket):
     # UPDSA does not update marks at this time. Actual use case will have no
     # mark set. Test this use case.
     self.AddSaInfo(src, dst, spi, XFRM_MODE_TUNNEL, 0, encryption, auth_trunc,
-                   None, None, None, output_mark, xfrm_if_id=xfrm_if_id)
+                   None, encap, None, output_mark, xfrm_if_id=xfrm_if_id)
 
     if selector is None:
       selectors = [EmptySelector(AF_INET), EmptySelector(AF_INET6)]
@@ -718,7 +720,7 @@ class Xfrm(netlink.NetlinkSocket):
   def MigrateTunnel(self, direction, selector, old_saddr, old_daddr,
                     new_saddr, new_daddr, spi,
                     encryption, auth_trunc, aead,
-                    encap, new_output_mark, xfrm_if_id):
+                    new_encap, new_output_mark, xfrm_if_id):
     """Update addresses and underlying network of Policies and an SA
 
     Args:
@@ -734,7 +736,7 @@ class Xfrm(netlink.NetlinkSocket):
       encryption: A tuple of an XfrmAlgo and raw key bytes, or None.
       auth_trunc: A tuple of an XfrmAlgoAuth and raw key bytes, or None.
       aead: A tuple of an XfrmAlgoAead and raw key bytes, or None.
-      encap: An XfrmEncapTmpl structure, or None.
+      new_encap: The XfrmEncapTmpl the SA will be migrated to, or None.
       new_output_mark: The mark used to select the new underlying network
         for packets outbound from xfrm. None means unspecified.
       xfrm_if_id: The XFRM interface ID
@@ -761,6 +763,9 @@ class Xfrm(netlink.NetlinkSocket):
     if xfrm_if_id is not None:
       nlattrs.append((XFRMA_IF_ID, struct.pack("=I", xfrm_if_id)))
 
+    if new_encap is not None:
+      nlattrs.append((XFRMA_ENCAP, new_encap))
+
     migrated = False
     try:
       for selector in selectors:
@@ -776,12 +781,16 @@ class Xfrm(netlink.NetlinkSocket):
       return migrated, e
 
     # UPDSA is called exclusively to update the set_mark=new_output_mark.
-    try:
-      self.AddSaInfo(new_saddr, new_daddr, spi, XFRM_MODE_TUNNEL, 0, encryption,
-                     auth_trunc, aead, encap, None, new_output_mark, True,
-                     xfrm_if_id)
-    except IOError as e:
-      return True, e
+    # Skip it for inbound SAs (which have no output mark) so that if MIGRATE
+    # fails to update encap_port, the failure is not hidden by UPDSA updating it.
+    if direction == XFRM_POLICY_OUT:
+      try:
+        # Update the mark of the migrated SA.
+        self.AddSaInfo(new_saddr, new_daddr, spi, XFRM_MODE_TUNNEL, 0,
+                       encryption, auth_trunc, aead, new_encap, None,
+                       new_output_mark, is_update=True, xfrm_if_id=xfrm_if_id)
+      except IOError as e:
+        return True, e
 
     return True, None
 

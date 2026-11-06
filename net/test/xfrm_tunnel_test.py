@@ -319,10 +319,11 @@ class IpSecBaseInterface(object):
   def TeardownInterface(self):
     self.iproute.DeleteLink(self.iface)
 
-  def SetupXfrm(self, use_null_crypt):
+  def SetupXfrm(self, use_null_crypt, encap_port=None):
     rand_spi = random.randint(0, 0x7fffffff)
     self.in_sa = SaInfo(rand_spi)
     self.out_sa = SaInfo(rand_spi)
+    self.encap_port = encap_port
 
     # Select algorithms:
     if use_null_crypt:
@@ -460,14 +461,27 @@ class XfrmInterface(IpSecBaseInterface):
     """Create an XFRM interface."""
     return self.iproute.CreateXfrmInterface(self.iface, self.netid, self.ifindex)
 
+  def _MakeEncapTmpl(self, sport, dport):
+    return xfrm.XfrmEncapTmpl((
+        xfrm.UDP_ENCAP_ESPINUDP, htons(sport), htons(dport), 16 * b"\x00"))
+
   def _SetupXfrmByType(self, auth_algo, crypt_algo):
+    out_encap = None
+    in_encap = None
+    if self.encap_port is not None:
+      out_encap = self._MakeEncapTmpl(
+          self.encap_port, xfrm_base.REMOTE_UDP_ENCAP_PORT)
+      in_encap = self._MakeEncapTmpl(
+          xfrm_base.REMOTE_UDP_ENCAP_PORT, self.encap_port)
+
     self.xfrm.CreateTunnel(xfrm.XFRM_POLICY_OUT, None, self.local, self.remote,
                            self.out_sa.spi, crypt_algo, auth_algo, None,
                            self.underlying_netid, self.xfrm_if_id,
-                           xfrm.MATCH_METHOD_ALL)
+                           xfrm.MATCH_METHOD_ALL, out_encap)
     self.xfrm.CreateTunnel(xfrm.XFRM_POLICY_IN, None, self.remote, self.local,
                            self.in_sa.spi, crypt_algo, auth_algo, None, None,
-                           self.xfrm_if_id, xfrm.MATCH_METHOD_IFID)
+                           self.xfrm_if_id, xfrm.MATCH_METHOD_IFID,
+                           in_encap)
 
   def TeardownXfrm(self):
     self.xfrm.DeleteTunnel(xfrm.XFRM_POLICY_OUT, None, self.remote,
@@ -503,13 +517,22 @@ class XfrmInterface(IpSecBaseInterface):
     self.xfrm.DeleteSaInfo(self.remote, old_out_spi, IPPROTO_ESP, None,
                            self.xfrm_if_id)
 
-  def Migrate(self, new_underlying_netid, new_local, new_remote):
+  def Migrate(self, new_underlying_netid, new_local, new_remote,
+              new_encap_port=None):
     old_local = self.local
+    in_encap = None
+    out_encap = None
+
+    if new_encap_port is not None:
+      in_encap = self._MakeEncapTmpl(
+          xfrm_base.REMOTE_UDP_ENCAP_PORT, new_encap_port)
+      out_encap = self._MakeEncapTmpl(
+          new_encap_port, xfrm_base.REMOTE_UDP_ENCAP_PORT)
 
     in_migrated, err = self.xfrm.MigrateTunnel(
         xfrm.XFRM_POLICY_IN, None, self.remote, old_local,
         new_remote, new_local, self.in_sa.spi,
-        self.crypt, self.auth, None, None,
+        self.crypt, self.auth, None, in_encap,
         new_underlying_netid, self.xfrm_if_id)
     if in_migrated:
       self.local = new_local
@@ -519,7 +542,7 @@ class XfrmInterface(IpSecBaseInterface):
     out_migrated, err = self.xfrm.MigrateTunnel(
         xfrm.XFRM_POLICY_OUT, None, old_local, self.remote,
         new_local, new_remote, self.out_sa.spi,
-        self.crypt, self.auth, None, None,
+        self.crypt, self.auth, None, out_encap,
         new_underlying_netid, self.xfrm_if_id)
     if out_migrated:
       self.remote = new_remote
@@ -528,6 +551,7 @@ class XfrmInterface(IpSecBaseInterface):
 
     self.version = net_test.GetAddressVersion(new_local)
     self.underlying_netid = new_underlying_netid
+    self.encap_port = new_encap_port
 
 
 class XfrmTunnelBase(xfrm_base.XfrmBaseTest):
@@ -757,7 +781,7 @@ class XfrmTunnelBase(xfrm_base.XfrmBaseTest):
     # Make sure it appeared on the underlying interface
     pkt = self._ExpectEspPacketOn(tunnel.underlying_netid, tunnel.out_sa.spi,
                                   tunnel.out_sa.seq_num, None, tunnel.local,
-                                  tunnel.remote)
+                                  tunnel.remote, tunnel.encap_port)
 
     # Check that packet is not sent in plaintext
     self.assertTrue(bytes(net_test.UDP_PAYLOAD) not in bytes(pkt))
@@ -769,6 +793,8 @@ class XfrmTunnelBase(xfrm_base.XfrmBaseTest):
     # Check that the interface statistics recorded the outbound packet
     self.assertSentPacket(tunnel, tunnel.out_sa)
 
+    read_sock, local_port = _CreateReceiveSock(inner_version,
+                                               _TEST_REMOTE_PORT)
     try:
       # Swap the interface addresses to pretend we are the remote
       self._SwapInterfaceAddress(
@@ -776,9 +802,11 @@ class XfrmTunnelBase(xfrm_base.XfrmBaseTest):
 
       # Swap the packet's IP headers and write it back to the underlying
       # network.
+      if tunnel.encap_port is not None:
+        pkt[scapy.UDP].sport, pkt[scapy.UDP].dport = (
+            pkt[scapy.UDP].dport, pkt[scapy.UDP].sport)
+        pkt[scapy.UDP].chksum = None
       pkt = TunTwister.TwistPacket(pkt)
-      read_sock, local_port = _CreateReceiveSock(inner_version,
-                                                 _TEST_REMOTE_PORT)
       self.ReceivePacketOn(tunnel.underlying_netid, pkt)
 
       # Verify that the packet data and src are correct
@@ -788,9 +816,8 @@ class XfrmTunnelBase(xfrm_base.XfrmBaseTest):
 
       # Check that the interface statistics recorded the inbound packet
       self.assertReceivedPacket(tunnel, tunnel.in_sa)
-
-      read_sock.close()
     finally:
+      read_sock.close()
       # Swap the interface addresses to pretend we are the remote
       self._SwapInterfaceAddress(
           tunnel.iface, new_addr=local_inner, old_addr=remote_inner)
@@ -838,7 +865,7 @@ class XfrmTunnelBase(xfrm_base.XfrmBaseTest):
     self._CheckTunnelEncryption(tunnel, inner_version, local_inner,
                                 remote_inner)
 
-  def  _RebuildTunnel(self, tunnel, use_null_crypt):
+  def _RebuildTunnel(self, tunnel, use_null_crypt, encap_port=None):
     # Some tests require that the out_seq_num and in_seq_num are the same
     # (Specifically encrypted tests), rebuild SAs to ensure seq_num is 1
     #
@@ -853,7 +880,7 @@ class XfrmTunnelBase(xfrm_base.XfrmBaseTest):
     # sent only 1, # seq_num_out = 1, inbound SA would consider this a replay
     # attack)
     tunnel.TeardownXfrm()
-    tunnel.SetupXfrm(use_null_crypt)
+    tunnel.SetupXfrm(use_null_crypt, encap_port)
 
   def _TestTunnel(self, inner_version, outer_version, func, use_null_crypt):
     """Bootstrap method to setup and run tests for the given parameters."""
@@ -1026,7 +1053,7 @@ class XfrmInterfaceMigrateTest(XfrmTunnelBase):
     tunnel.Teardown()
 
   def _TestTunnel(self, inner_version, outer_version, new_outer_version, func,
-                  use_null_crypt):
+                  use_null_crypt, old_encap_port=None, new_encap_port=None):
     tunnel = self.randomTunnel(outer_version)
 
     old_underlying_netid = tunnel.underlying_netid
@@ -1035,7 +1062,7 @@ class XfrmInterfaceMigrateTest(XfrmTunnelBase):
     old_version = tunnel.version
 
     try:
-      self._RebuildTunnel(tunnel, use_null_crypt)
+      self._RebuildTunnel(tunnel, use_null_crypt, old_encap_port)
 
       # Verify functionality before migration
       local_inner = tunnel.addrs[inner_version]
@@ -1048,7 +1075,8 @@ class XfrmInterfaceMigrateTest(XfrmTunnelBase):
       new_local = self.MyAddress(new_version, new_underlying_netid)
       new_remote = net_test.IPV4_ADDR2 if new_version == 4 else net_test.IPV6_ADDR2
 
-      tunnel.Migrate(new_underlying_netid, new_local, new_remote)
+      tunnel.Migrate(new_underlying_netid, new_local, new_remote,
+                     new_encap_port)
 
       # Verify functionality after migration
       func(tunnel, inner_version, local_inner, remote_inner)
@@ -1091,6 +1119,52 @@ class XfrmInterfaceMigrateTest(XfrmTunnelBase):
                                     new_outer_version):
     self._TestTunnel(inner_version, outer_version, new_outer_version,
                      self._CheckTunnelRekey, True)
+
+  def testMigrateXfrmIntfInOutEncryptedPreserveEncap(self):
+    encap_sock, encap_port = xfrm_base.CreateUdpEncapSocket(AF_INET)
+
+    try:
+      for inner_version in [4, 6]:
+        self._TestTunnel(inner_version, 4, 4, self._CheckTunnelEncryption,
+                         False, encap_port, encap_port)
+    finally:
+      encap_sock.close()
+
+  def testMigrateXfrmIntfInOutEncryptedUpdateEncapPorts(self):
+    old_encap_sock, old_encap_port = xfrm_base.CreateUdpEncapSocket(AF_INET)
+    new_encap_sock, new_encap_port = xfrm_base.CreateUdpEncapSocket(AF_INET)
+
+    try:
+      for inner_version in [4, 6]:
+        self._TestTunnel(inner_version, 4, 4, self._CheckTunnelEncryption,
+                         False, old_encap_port, new_encap_port)
+    finally:
+      old_encap_sock.close()
+      new_encap_sock.close()
+
+  def testMigrateXfrmIntfInOutEncryptedAddEncap(self):
+    new_encap_sock, new_encap_port = xfrm_base.CreateUdpEncapSocket(AF_INET)
+
+    try:
+      for inner_version in [4, 6]:
+        self._TestTunnel(inner_version, 4, 4, self._CheckTunnelEncryption,
+                         False, None, new_encap_port)
+    finally:
+      new_encap_sock.close()
+
+  # Upstream commit b8addb8884f2 ("xfrm: allow migration from UDP encapsulated
+  # to non-encapsulated ESP") is in Linux 7.2 and is not backported.
+  @unittest.skipUnless(net_test.KernelAtLeast([(7, 2, 0)]),
+                       "XFRM_MSG_MIGRATE cannot remove UDP encap before 7.2")
+  def testMigrateXfrmIntfInOutEncryptedRemoveEncap(self):
+    old_encap_sock, old_encap_port = xfrm_base.CreateUdpEncapSocket(AF_INET)
+
+    try:
+      for inner_version in [4, 6]:
+        self._TestTunnel(inner_version, 4, 4, self._CheckTunnelEncryption,
+                         False, old_encap_port, None)
+    finally:
+      old_encap_sock.close()
 
 if __name__ == "__main__":
   InjectTests()
