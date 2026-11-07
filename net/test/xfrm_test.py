@@ -25,7 +25,6 @@ import threading
 import unittest
 
 import csocket
-import cstruct
 import multinetwork_base
 import net_test
 import packets
@@ -52,17 +51,6 @@ TEST_SPI2 = 0x1235
 
 
 class XfrmFunctionalTest(xfrm_base.XfrmLazyTest):
-
-  def assertIsUdpEncapEsp(self, packet, spi, seq, length):
-    protocol = packet.nh if packet.version == 6 else packet.proto
-    self.assertEqual(IPPROTO_UDP, protocol)
-    udp_hdr = packet[scapy.UDP]
-    self.assertEqual(4500, udp_hdr.dport)
-    self.assertEqual(length, len(udp_hdr))
-    esp_hdr, _ = cstruct.Read(bytes(udp_hdr.payload), xfrm.EspHdr)
-    # FIXME: this file currently swaps SPI byte order manually, so SPI needs to
-    # be double-swapped here.
-    self.assertEqual(xfrm.EspHdr((spi, seq)), esp_hdr)
 
   def CreateNewSa(self, localAddr, remoteAddr, spi, reqId, encap_tmpl,
                   null_auth=False):
@@ -220,14 +208,7 @@ class XfrmFunctionalTest(xfrm_base.XfrmLazyTest):
     remoteaddr = self.GetRemoteAddress(version)
     family = net_test.GetAddressFamily(version)
 
-    # Reserve a port on which to receive UDP encapsulated packets. Sending
-    # packets works without this (and potentially can send packets with a source
-    # port belonging to another application), but receiving requires the port to
-    # be bound and the encapsulation socket option enabled.
-    encap_sock = net_test.Socket(family, SOCK_DGRAM, 0)
-    encap_sock.bind((myaddr, 0))
-    encap_port = encap_sock.getsockname()[1]
-    encap_sock.setsockopt(IPPROTO_UDP, xfrm.UDP_ENCAP, xfrm.UDP_ENCAP_ESPINUDP)
+    encap_sock, encap_port = xfrm_base.CreateUdpEncapSocket(family, myaddr)
 
     # Open a socket to send traffic.
     # TODO: test with a different family than the encap socket.
@@ -245,7 +226,8 @@ class XfrmFunctionalTest(xfrm_base.XfrmLazyTest):
 
     # Create inbound and outbound SAs that specify UDP encapsulation.
     encaptmpl = xfrm.XfrmEncapTmpl((xfrm.UDP_ENCAP_ESPINUDP, htons(encap_port),
-                                    htons(4500), 16 * b"\x00"))
+                                    htons(xfrm_base.REMOTE_UDP_ENCAP_PORT),
+                                    16 * b"\x00"))
     self.CreateNewSa(myaddr, remoteaddr, out_spi, out_reqid, encaptmpl,
                      use_null_auth)
 
@@ -285,7 +267,9 @@ class XfrmFunctionalTest(xfrm_base.XfrmLazyTest):
     expected_len = xfrm_base.GetEspPacketLength(
         xfrm.XFRM_MODE_TRANSPORT, version, True, net_test.UDP_PAYLOAD,
         auth_algo, xfrm_base._ALGO_CBC_AES_256)
-    self.assertIsUdpEncapEsp(packet, out_spi, seq_num, expected_len)
+    self.assertIsUdpEncapEsp(
+        packet, out_spi, seq_num, expected_len, encap_port,
+        xfrm_base.REMOTE_UDP_ENCAP_PORT)
 
     # Now test the receive path. Because we don't know how to decrypt packets,
     # we just play back the encrypted packet that kernel sent earlier. We swap
@@ -311,8 +295,10 @@ class XfrmFunctionalTest(xfrm_base.XfrmLazyTest):
 
     # Now play back the valid packet and check that we receive it.
     ip = {4: scapy.IP, 6: scapy.IPv6}[version]
-    incoming = (ip(src=remoteaddr, dst=myaddr) /
-                scapy.UDP(sport=4500, dport=encap_port) / payload)
+    incoming = (
+        ip(src=remoteaddr, dst=myaddr) /
+        scapy.UDP(sport=xfrm_base.REMOTE_UDP_ENCAP_PORT, dport=encap_port) /
+        payload)
     incoming = ip(bytes(incoming))
     self.ReceivePacketOn(netid, incoming)
 
@@ -421,7 +407,8 @@ class XfrmFunctionalTest(xfrm_base.XfrmLazyTest):
     # Create inbound and outbound SAs that specify UDP encapsulation.
     reqid = 123
     encaptmpl = xfrm.XfrmEncapTmpl((xfrm.UDP_ENCAP_ESPINUDP, htons(encap_port),
-                                    htons(4500), 16 * b"\x00"))
+                                    htons(xfrm_base.REMOTE_UDP_ENCAP_PORT),
+                                    16 * b"\x00"))
     self.xfrm.AddSaInfo(remoteaddr, myaddr, TEST_SPI, mode, reqid,
                     xfrm_base._ALGO_CRYPT_NULL, xfrm_base._ALGO_AUTH_NULL, None,
                     encaptmpl, None, None)
@@ -446,9 +433,10 @@ class XfrmFunctionalTest(xfrm_base.XfrmLazyTest):
       inner_pkt = xfrm.EspHdr(spi=TEST_SPI, seqnum=1).Pack() + bytes(
           scapy.UDP(sport=443, dport=32123) / data) + bytes(
           xfrm_base.GetEspTrailer(len(data), IPPROTO_UDP))
-      input_pkt = (IpType(src=remoteaddr, dst=myaddr) /
-                   scapy.UDP(sport=4500, dport=encap_port) /
-                   inner_pkt)
+      input_pkt = (
+          IpType(src=remoteaddr, dst=myaddr) /
+          scapy.UDP(sport=xfrm_base.REMOTE_UDP_ENCAP_PORT, dport=encap_port) /
+          inner_pkt)
     else:
       # TODO: test IPv4 in IPv6 encap and vice versa.
       data = b""  # Empty UDP payload
@@ -458,9 +446,10 @@ class XfrmFunctionalTest(xfrm_base.XfrmLazyTest):
           IpType(src=remoteaddr, dst=myaddr) /
           scapy.UDP(sport=443, dport=32123) / data) + bytes(
           xfrm_base.GetEspTrailer(len(data), {4: IPPROTO_IPIP, 6: IPPROTO_IPV6}[version]))
-      input_pkt = (IpType(src=remoteaddr, dst=myaddr) /
-                   scapy.UDP(sport=4500, dport=encap_port) /
-                   inner_pkt)
+      input_pkt = (
+          IpType(src=remoteaddr, dst=myaddr) /
+          scapy.UDP(sport=xfrm_base.REMOTE_UDP_ENCAP_PORT, dport=encap_port) /
+          inner_pkt)
 
     # input_pkt.show2()
     self.ReceivePacketOn(netid, input_pkt)
