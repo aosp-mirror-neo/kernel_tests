@@ -227,9 +227,8 @@ EspHdr = cstruct.Struct("EspHdr", "!II", "spi seqnum")
 _DEFAULT_REPLAY_WINDOW = 32
 ALL_ALGORITHMS = 0xffffffff
 
-# Policy-SA match method (for VTI/XFRM-I).
+# Policy-SA match method (for XFRM-I).
 MATCH_METHOD_ALL = "all"
-MATCH_METHOD_MARK = "mark"
 MATCH_METHOD_IFID = "ifid"
 
 
@@ -666,24 +665,16 @@ class Xfrm(netlink.NetlinkSocket):
       output_mark: The mark used to select the underlying network for packets
         outbound from xfrm. None means unspecified.
       xfrm_if_id: The ID of the XFRM interface to use or None.
-      match_method: One of MATCH_METHOD_[MARK | ALL | IFID]. This determines how
+      match_method: One of MATCH_METHOD_[ALL | IFID]. This determines how
         SAs and policies are matched.
       encap: An XfrmEncapTmpl structure, or None.
     """
     outer_family = net_test.GetAddressFamily(net_test.GetAddressVersion(dst))
 
-    # SA mark is currently unused due to UPDSA not updating marks.
-    # Kept as documentation of ideal/desired behavior.
-    if match_method == MATCH_METHOD_MARK:
-      # sa_mark = mark
-      tmpl_spi = 0
-      if_id = None
-    elif match_method == MATCH_METHOD_ALL:
-      # sa_mark = mark
+    if match_method == MATCH_METHOD_ALL:
       tmpl_spi = spi
       if_id = xfrm_if_id
     elif match_method == MATCH_METHOD_IFID:
-      # sa_mark = None
       tmpl_spi = 0
       if_id = xfrm_if_id
     else:
